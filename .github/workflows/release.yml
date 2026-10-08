@@ -45,7 +45,7 @@ jobs:
             f {print}' CHANGELOG.md > notes.md
           if [ -s notes.md ]; then echo "generate=false" >> "$GITHUB_OUTPUT"
           else echo "generate=true" >> "$GITHUB_OUTPUT"; fi
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           body_path: notes.md
           generate_release_notes: ${{ steps.notes.outputs.generate }}
