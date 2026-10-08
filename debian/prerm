@@ -4,8 +4,8 @@ set -e
 # or a manual PCI rescan restores it. PERSIST=0 keeps the saved choice, so a
 # reinstall without purge restores it.
 if [ "$1" = remove ] || [ "$1" = deconfigure ]; then
-    if [ -x /usr/bin/arc-dgpu-ctl ]; then
-        PERSIST=0 /usr/bin/arc-dgpu-ctl on || true
+    if command -v arc-dgpu-ctl >/dev/null 2>&1; then
+        PERSIST=0 arc-dgpu-ctl on || true
     fi
 fi
 #DEBHELPER#

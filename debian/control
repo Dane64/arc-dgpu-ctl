@@ -11,7 +11,7 @@ Vcs-Git: https://github.com/Dane64/arc-dgpu-ctl.git
 
 Package: arc-dgpu-ctl
 Architecture: all
-Depends: ${misc:Depends}, bash, mawk | awk, kmod, udev
+Depends: ${misc:Depends}, kmod, udev
 Description: runtime power-off for Intel Arc (Alchemist) discrete GPUs
  Unbinds the HDA audio companion and i915/xe from an Intel Arc Alchemist
  (DG2) GPU in a safe order and removes it from the PCI bus so the PCIe root

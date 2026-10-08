@@ -69,6 +69,8 @@ mkproc() {   # mkproc <pid> <comm> <fdinfo> [exe] [devnode]
 }
 I915='drm-driver:\ti915\ndrm-pdev:\t0000:03:00.0\ndrm-client-id:\t7\n'
 reset_proc() { rm -rf "$PROC_ROOT"; mkdir -p "$PROC_ROOT"; }
+# These overrides are invoked indirectly by check_users in the sourced script.
+# shellcheck disable=SC2317,SC2329
 sample_wait() { :; }
 
 reset_proc
@@ -123,8 +125,10 @@ printf '7f00-7f10 rw-s 1000 00:05 42 /dev/dri/renderD128\n' > "$PROC_ROOT/4007/m
 t  "mmap of another GPU's node ignored"   check_users
 reset_proc
 mkproc 1577 kwin_wayland   "${I915}drm-engine-render:\t100 ns\n"
+# shellcheck disable=SC2317,SC2329
 sample_wait() { printf '%b' "${I915}drm-engine-render:\t200 ns\n" > "$PROC_ROOT/1577/fdinfo/9"; }
 tn "session holder rendering on dGPU refused" check_users
+# shellcheck disable=SC2317,SC2329
 sample_wait() { :; }
 reset_proc
 mkproc 1577 kwin_wayland   "$I915"
