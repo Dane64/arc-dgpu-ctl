@@ -58,7 +58,7 @@ jobs:
           [ "$st" = on ] || [ "$st" = off ]
           apt-get purge -y arc-dgpu-ctl
           ! command -v arc-dgpu-ctl
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: deb
           path: dist/*.deb
