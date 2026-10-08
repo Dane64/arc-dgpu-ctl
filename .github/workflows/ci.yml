@@ -57,6 +57,8 @@ jobs:
           st=$(su nobody -s /bin/sh -c 'arc-dgpu-ctl state')   # in a normal user's PATH
           [ "$st" = on ] || [ "$st" = off ]
           apt-get purge -y arc-dgpu-ctl
+          hash -r   # bash cached the path from the earlier call
+          test ! -e /usr/bin/arc-dgpu-ctl
           ! command -v arc-dgpu-ctl
       - uses: actions/upload-artifact@v6
         with:
