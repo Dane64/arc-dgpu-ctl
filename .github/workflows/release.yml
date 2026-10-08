@@ -21,7 +21,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends build-essential debhelper git ca-certificates
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Tag must match VERSION

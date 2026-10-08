@@ -14,14 +14,14 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: make lint
 
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Tests (no root, no GPU)
         run: make test
       - name: Staged install (DESTDIR)
@@ -41,7 +41,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends build-essential debhelper lintian git ca-certificates
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build .deb
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
