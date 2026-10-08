@@ -45,7 +45,7 @@ STATE_DIR=/var/lib/arc-dgpu-ctl
 STATE_FILE=$STATE_DIR/state
 
 log()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
-vlog() { [[ $VERBOSE == 1 ]] && log "$*" || true; }
+vlog() { if [[ $VERBOSE == 1 ]]; then log "$*"; fi; }
 die()  { log "$*"; exit 1; }
 
 # shellcheck source=data/arc-dgpu-ctl.conf
@@ -582,7 +582,9 @@ cache_port() {
     # no longer walk up from it to find the PCIe port, and status goes blind.
     local port
     if port=$(upstream_port); then
-        [[ $EUID -eq 0 ]] && { echo "$port" > "$PORTCACHE"; } 2>/dev/null || true
+        if [[ $EUID -eq 0 ]]; then
+            { echo "$port" > "$PORTCACHE"; } 2>/dev/null || true
+        fi
         echo "$port"
         return 0
     fi
