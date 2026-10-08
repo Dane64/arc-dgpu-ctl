@@ -1,0 +1,89 @@
+.TH ARC-DGPU-CTL 8 "" "arc-dgpu-ctl" "System Administration"
+.SH NAME
+arc-dgpu-ctl \- power off / on an Intel Arc (Alchemist) discrete GPU at runtime
+.SH SYNOPSIS
+.B arc-dgpu-ctl
+.RI [ command ]
+.SH DESCRIPTION
+.B arc-dgpu-ctl
+unbinds the HDA audio companion and the i915/xe driver of an Intel Arc
+Alchemist (DG2) GPU in a safe order and removes both from the PCI bus, so the
+PCIe root port can enter D3cold. It restores the GPU without a reboot.
+.PP
+Mobile Arc (A350M\(enA770M) is supported. Desktop A380, A580, A750 and A770
+are supported only when every display is connected to the CPU's integrated
+GPU. Other Alchemist models require \fBALLOW_UNSUPPORTED=1\fR.
+.SH COMMANDS
+.TP
+.B status
+State, model, bound drivers, PCIe port power states and power draw (default).
+.TP
+.B state
+Print exactly \fBon\fR or \fBoff\fR. Machine-readable; for other programs.
+.TP
+.B on
+Rescan the PCI bus, clear a stale driver_override and rebind drivers. Root.
+.TP
+.B off
+Run the safety checks, unbind snd_hda_intel then i915/xe, PCI-remove both. Root.
+.TP
+.B restore
+Apply the saved state: switch off if the last \fBon\fR/\fBoff\fR was \fBoff\fR.
+Run at boot by \fIarc-dgpu-ctl.service\fR. Root.
+.TP
+.B power
+Power readings only (dGPU hwmon, CPU package RAPL, battery discharge).
+.TP
+.B diag
+Troubleshooting dump.
+.TP
+.B version
+Print the version.
+.SH SAFETY CHECKS
+\fBoff\fR refuses when no other display controller is active, when a monitor
+is connected to the dGPU, when the dGPU is the firmware boot display, or when
+the dGPU is bound to vfio-pci, audio is playing through its HDMI/DP codec, or
+a process has work, memory or mapped buffers on the dGPU, or engine activity
+is seen during a short sample. Holders are found by device number, including
+processes in containers. Idle handles of Xorg, compositors, Xwayland,
+plymouth, systemd-logind and PID 1 (\fBSESSION_HOLDERS\fR, system binaries
+only, up to \fBSESSION_MEM_MAX\fR MiB), and handles that were only opened for
+GPU enumeration, do not block. \fBFORCE=1\fR skips these checks.
+.SH ENVIRONMENT
+.TP
+.B FORCE=1
+Skip the safety checks on \fBoff\fR.
+.TP
+.B ALLOW_UNSUPPORTED=1
+Allow Alchemist models that are not on the supported list.
+.TP
+.B PERSIST=0
+Switch \fBon\fR/\fBoff\fR without changing the saved boot state.
+.TP
+.B VERBOSE=1
+Log each step.
+.TP
+.B ARC_DGPU_CTL_CONF
+Alternative configuration file (default \fI/etc/arc-dgpu-ctl.conf\fR).
+.SH FILES
+.TP
+.I /etc/arc-dgpu-ctl.conf
+Optional PCI address and driver overrides.
+.TP
+.I arc-dgpu-ctl.service
+systemd unit running \fBrestore\fR before the display manager. Enabled; does
+nothing until \fBoff\fR has been run.
+.TP
+.I /var/lib/arc-dgpu-ctl/state
+Saved state, \fBon\fR or \fBoff\fR.
+.TP
+.I 99-arc-dgpu-ctl.rules
+udev rule that clears driver_override on Arc Alchemist devices.
+.TP
+.I /run/arc-dgpu-ctl.port
+Cached PCIe port path.
+.SH EXIT STATUS
+0 success, 1 error, 2 usage error.
+.SH SEE ALSO
+.BR systemctl (1),
+.BR udevadm (8)

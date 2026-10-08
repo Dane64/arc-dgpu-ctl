@@ -1,0 +1,22 @@
+Source: arc-dgpu-ctl
+Section: admin
+Priority: optional
+Maintainer: Dane64 <Dane64@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/Dane64/arc-dgpu-ctl
+Vcs-Browser: https://github.com/Dane64/arc-dgpu-ctl
+Vcs-Git: https://github.com/Dane64/arc-dgpu-ctl.git
+
+Package: arc-dgpu-ctl
+Architecture: all
+Depends: ${misc:Depends}, bash, mawk | awk, kmod, udev
+Description: runtime power-off for Intel Arc (Alchemist) discrete GPUs
+ Unbinds the HDA audio companion and i915/xe from an Intel Arc Alchemist
+ (DG2) GPU in a safe order and removes it from the PCI bus so the PCIe root
+ port can reach D3cold, then restores it at runtime without a reboot.
+ .
+ Supports the mobile Arc A-series, and desktop A380/A580/A750/A770 when the
+ displays are driven by the integrated GPU. The boot-time service is shipped
+ disabled.

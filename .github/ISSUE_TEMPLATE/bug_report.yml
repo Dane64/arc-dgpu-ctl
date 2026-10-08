@@ -1,0 +1,42 @@
+name: Bug report
+description: arc-dgpu-ctl does something wrong (GPU does not come back, kernel WARN, no D3cold, ...)
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        GPU stuck off? `sudo sh -c 'echo 1 > /sys/bus/pci/rescan'` or `sudo arc-dgpu-ctl on` from a TTY (a saved `off` is re-applied at boot).
+  - type: input
+    id: version
+    attributes: { label: Version, description: "`arc-dgpu-ctl version`", placeholder: "arc-dgpu-ctl 4.0.0" }
+    validations: { required: true }
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installed via
+      options: [".deb from GitHub Releases", "install.sh", "make install", "as a submodule of another project", "other"]
+    validations: { required: true }
+  - type: dropdown
+    id: gpu
+    attributes:
+      label: GPU
+      options: [A350M, A370M, A530M, A550M, A570M, A730M, A770M, A380, A580, A750, A770, other]
+    validations: { required: true }
+  - type: input
+    id: distro
+    attributes: { label: Distro + kernel, description: "`lsb_release -ds; uname -r`" }
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes: { label: What happened, description: "Command run, what you expected, what you got" }
+    validations: { required: true }
+  - type: textarea
+    id: diag
+    attributes: { label: "`sudo arc-dgpu-ctl diag` output", render: text }
+    validations: { required: true }
+  - type: textarea
+    id: dmesg
+    attributes:
+      label: Kernel log
+      description: "`sudo dmesg | grep -Ei 'i915|xe|drm|pcieport|cut here' | tail -80`"
+      render: text

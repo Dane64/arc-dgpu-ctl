@@ -1,0 +1,56 @@
+name: Release
+
+# Push a tag vX.Y.Z whose number equals the VERSION file (docs/RELEASING.md).
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    container: debian:testing
+    steps:
+      - name: Tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential debhelper git ca-certificates
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag must match VERSION
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          [ "${GITHUB_REF_NAME#v}" = "$(cat VERSION)" ] || {
+            echo "tag $GITHUB_REF_NAME does not match VERSION $(cat VERSION)"; exit 1; }
+      - name: Build artifacts
+        run: |
+          make dist
+          make deb
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Release notes
+        id: notes
+        run: |
+          # Use the matching CHANGELOG.md section if there is one,
+          # otherwise fall back to GitHub's generated notes.
+          awk -v v="$(cat VERSION)" '
+            $0 ~ "^## \\[" v "\\]" {f=1; next}
+            f && /^## \[/ {exit}
+            f {print}' CHANGELOG.md > notes.md
+          if [ -s notes.md ]; then echo "generate=false" >> "$GITHUB_OUTPUT"
+          else echo "generate=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          generate_release_notes: ${{ steps.notes.outputs.generate }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/SHA256SUMS

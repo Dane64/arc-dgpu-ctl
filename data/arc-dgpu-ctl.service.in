@@ -1,0 +1,18 @@
+[Unit]
+Description=Restore the saved Intel Arc dGPU power state (arc-dgpu-ctl)
+Documentation=man:arc-dgpu-ctl(8) https://github.com/Dane64/arc-dgpu-ctl
+# Only does something after `arc-dgpu-ctl off` saved "off". Runs once the PCI
+# drivers are probed and BEFORE the display manager, so Xorg / the compositor
+# never pick up the dGPU in the first place.
+After=systemd-udev-trigger.service systemd-modules-load.service
+Before=display-manager.service
+ConditionPathExists=/var/lib/arc-dgpu-ctl/state
+
+[Service]
+Type=oneshot
+Environment=VERBOSE=1
+ExecStart=@BINDIR@/arc-dgpu-ctl restore
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

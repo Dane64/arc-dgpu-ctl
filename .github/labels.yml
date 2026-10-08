@@ -1,0 +1,18 @@
+# Source of truth for repo labels - synced by .github/workflows/labels.yml
+- { name: bug,              color: d73a4a, description: "Something does not work" }
+- { name: enhancement,      color: a2eeef, description: "New feature or request" }
+- { name: mobile,           color: 5319e7, description: "Arc A-series mobile (A350M-A770M)" }
+- { name: desktop,          color: 8a63d2, description: "Arc desktop cards (A380/A580/A750/A770)" }
+- { name: documentation,    color: 0075ca, description: "README, man page, docs/" }
+- { name: packaging,        color: fbca04, description: "Debian package, install scripts, Makefile" }
+- { name: ci,               color: 1d76db, description: "GitHub Actions" }
+- { name: kernel,           color: b60205, description: "i915 / xe / PCI / runtime-PM behaviour" }
+- { name: power,            color: 0e8a16, description: "Power measurement / D3cold" }
+- { name: integration,      color: c5def5, description: "Use as submodule / CLI contract" }
+- { name: breaking-change,  color: 000000, description: "Changes the CLI contract or file locations" }
+- { name: needs-triage,     color: ededed, description: "Not yet looked at" }
+- { name: needs-info,       color: fef2c0, description: "Waiting for diag output / reporter" }
+- { name: good first issue, color: 7057ff, description: "Good for newcomers" }
+- { name: wontfix,          color: ffffff, description: "Will not be worked on" }
+- { name: duplicate,        color: cfd3d7, description: "Already reported" }
+- { name: dependencies,     color: 0366d6, description: "Dependabot updates" }

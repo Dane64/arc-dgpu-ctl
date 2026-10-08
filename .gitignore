@@ -1,0 +1,11 @@
+/build/
+/dist/
+# generated from VERSION by `make debian/changelog`
+debian/changelog
+debian/.debhelper/
+debian/arc-dgpu-ctl/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper
+debian/*.debhelper.log

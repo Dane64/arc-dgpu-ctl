@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+if [ "$1" = purge ]; then
+    rm -f /run/arc-dgpu-ctl.port
+    rm -rf /var/lib/arc-dgpu-ctl
+fi
+#DEBHELPER#
+exit 0

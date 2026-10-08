@@ -1,0 +1,10 @@
+# Categories for GitHub-generated release notes
+changelog:
+  exclude:
+    labels: [duplicate, wontfix]
+  categories:
+    - { title: Breaking changes, labels: [breaking-change] }
+    - { title: Fixes,            labels: [bug, kernel] }
+    - { title: Features,         labels: [enhancement, power, integration, desktop, mobile] }
+    - { title: Packaging & CI,   labels: [packaging, ci, dependencies] }
+    - { title: Other,            labels: ["*"] }

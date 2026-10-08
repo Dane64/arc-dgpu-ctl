@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:   # reused by release.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: make lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests (no root, no GPU)
+        run: make test
+      - name: Staged install (DESTDIR)
+        run: |
+          make install DESTDIR="$PWD/stage" PREFIX=/usr \
+            SYSTEMDUNITDIR=/usr/lib/systemd/system UDEVRULESDIR=/usr/lib/udev/rules.d
+          find stage -type f | sort
+          grep -q 'ExecStart=/usr/bin/arc-dgpu-ctl restore' stage/usr/lib/systemd/system/arc-dgpu-ctl.service
+          test "$(stage/usr/bin/arc-dgpu-ctl version)" = "arc-dgpu-ctl $(cat VERSION)"
+          udevadm verify stage/usr/lib/udev/rules.d/99-arc-dgpu-ctl.rules || true
+
+  deb:
+    runs-on: ubuntu-latest
+    container: debian:testing
+    steps:
+      - name: Build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential debhelper lintian git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Build .deb
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          make deb
+      - name: lintian
+        run: lintian --fail-on error --info dist/*.deb
+      - name: Install / remove / purge round-trip
+        run: |
+          apt-get install -y ./dist/*.deb
+          arc-dgpu-ctl version
+          test -f /usr/lib/udev/rules.d/99-arc-dgpu-ctl.rules
+          test -f /usr/lib/systemd/system/arc-dgpu-ctl.service
+          st=$(su nobody -s /bin/sh -c 'arc-dgpu-ctl state')   # in a normal user's PATH
+          [ "$st" = on ] || [ "$st" = off ]
+          apt-get purge -y arc-dgpu-ctl
+          ! command -v arc-dgpu-ctl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/*.deb

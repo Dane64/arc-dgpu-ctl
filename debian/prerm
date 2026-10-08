@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+# Bring the dGPU back before the binary disappears; otherwise only a reboot
+# or a manual PCI rescan restores it. PERSIST=0 keeps the saved choice, so a
+# reinstall without purge restores it.
+if [ "$1" = remove ] || [ "$1" = deconfigure ]; then
+    if [ -x /usr/bin/arc-dgpu-ctl ]; then
+        PERSIST=0 /usr/bin/arc-dgpu-ctl on || true
+    fi
+fi
+#DEBHELPER#
+exit 0

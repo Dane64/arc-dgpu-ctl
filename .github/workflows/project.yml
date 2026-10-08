@@ -1,0 +1,20 @@
+name: Add to project board
+
+# Adds every new issue / PR to the GitHub Project board.
+# Setup (docs/PROJECT_TRACKING.md): repo variable PROJECT_URL and secret
+# PROJECT_TOKEN. Without them this workflow is skipped.
+on:
+  issues:
+    types: [opened, reopened, transferred]
+  pull_request_target:
+    types: [opened, reopened]
+
+jobs:
+  add:
+    if: ${{ vars.PROJECT_URL != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/add-to-project@v1.0.2
+        with:
+          project-url: ${{ vars.PROJECT_URL }}
+          github-token: ${{ secrets.PROJECT_TOKEN }}

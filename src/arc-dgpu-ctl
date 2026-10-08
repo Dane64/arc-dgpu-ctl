@@ -1,0 +1,909 @@
+#!/usr/bin/env bash
+# arc-dgpu-ctl - runtime power-off for Intel Arc (Alchemist / DG2) dGPUs
+#
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Dane64
+#
+# The audio-first teardown avoids this kernel WARNING:
+#   i915 ... [drm] *ERROR* audio power refcount 1 after unbind
+#   WARNING: intel_runtime_pm.c:522 intel_runtime_pm_driver_release+0x76 [i915]
+#     -> i915 raw-wakerefs=1 wakelocks=1 on cleanup
+#
+# Cause: the dGPU's HDA audio function (separate PCI function/bus, driven by
+# snd_hda_intel) binds to i915 via the audio component and holds a display
+# power wakeref. Unbinding i915 first leaks that wakeref -> WARN splat.
+#
+# Fix: strict teardown order
+#   1) unbind snd_hda_intel from the dGPU audio function
+#   2) unbind i915 (or xe) from the dGPU VGA function
+#   3) PCI-remove both functions, so the upstream port can drop to D3cold
+# and strict bring-up order (rescan -> drivers bind VGA then audio).
+
+set -euo pipefail
+
+PROG=arc-dgpu-ctl
+# @VERSION@ is replaced from the top-level VERSION file at build/install time.
+# Running straight from a source checkout (e.g. a submodule) reads VERSION.
+VERSION="@VERSION@"
+if [[ $VERSION == @*@ ]]; then
+    VERSION=$(cat "$(dirname "$(readlink -f "$0")")/../VERSION" 2>/dev/null || echo unknown)
+fi
+
+CONF=${ARC_DGPU_CTL_CONF:-/etc/arc-dgpu-ctl.conf}
+DGPU_VGA=""
+DGPU_AUD=""
+VERBOSE=${VERBOSE:-0}
+
+# Remember the PCIe port so we can still report it after the GPU is gone.
+PORTCACHE=/run/arc-dgpu-ctl.port
+port_from_conf() { [[ -r $PORTCACHE ]] && { local p; p=$(<"$PORTCACHE"); [[ -d $p ]] && echo "$p"; }; }
+
+# Persistent user choice. `on`/`off` record it; at boot arc-dgpu-ctl.service
+# runs `restore`, which switches the dGPU off again only if the saved state is
+# off. Absent file = never chosen = leave the GPU alone.
+STATE_DIR=/var/lib/arc-dgpu-ctl
+STATE_FILE=$STATE_DIR/state
+
+log()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
+vlog() { [[ $VERBOSE == 1 ]] && log "$*" || true; }
+die()  { log "$*"; exit 1; }
+
+# shellcheck source=data/arc-dgpu-ctl.conf
+[[ -f $CONF ]] && . "$CONF"
+
+saved_state() {
+    local v=""
+    [[ -r $STATE_FILE ]] && v=$(<"$STATE_FILE")
+    case $v in on|off) echo "$v" ;; *) echo none ;; esac
+}
+
+save_state() {
+    [[ ${PERSIST:-1} == 1 ]] || { vlog "PERSIST=0: not saving '$1' as boot state"; return 0; }
+    { mkdir -p "$STATE_DIR" && printf '%s\n' "$1" > "$STATE_FILE.tmp" \
+        && mv -f "$STATE_FILE.tmp" "$STATE_FILE"; } 2>/dev/null \
+        || log "warning: could not save state to $STATE_FILE"
+}
+
+need_root() { [[ $EUID -eq 0 ]] || die "must be run as root"; }
+
+# ---------- device discovery ----------------------------------------------
+# Intel Arc Alchemist (DG2) PCI device IDs, from the kernel's i915/xe pciids.
+#   tier "mobile"  : tested and supported
+#   tier "desktop" : supported only with the display on the CPU's iGPU
+#   anything else that is DG2 (A310, Pro, embedded) is "unlisted" and refused
+#   unless ALLOW_UNSUPPORTED=1. Non-DG2 GPUs (Battlemage, NVIDIA, AMD, the
+#   iGPU itself) are never detected at all.
+DG2_IDS="5690 5691 5692 5693 5694 5695 5696 5697 56a0 56a1 56a2 56a3 56a4 56a5 56a6 56b0 56b1 56b2 56b3 56ba 56bb 56bc 56bd 56be 56bf"
+
+pci_id() { local v; v=$(<"$1/device"); v=${v#0x}; echo "${v,,}"; }
+
+is_alchemist() {
+    local d=$1 id
+    [[ $(<"$d/vendor") == 0x8086 ]] || return 1
+    id=$(pci_id "$d")
+    [[ " $DG2_IDS " == *" $id "* ]]
+}
+
+# prints "<tier> <name>"
+model_of() {
+    local d id
+    d=$(sysdev "$1")
+    id=$(pci_id "$d")
+    case $id in
+        5690) echo "mobile Arc A770M" ;;
+        5691) echo "mobile Arc A730M" ;;
+        5692) echo "mobile Arc A550M" ;;
+        5693) echo "mobile Arc A370M" ;;
+        5694) echo "mobile Arc A350M" ;;
+        5696) echo "mobile Arc A570M" ;;
+        5697) echo "mobile Arc A530M" ;;
+        56a0) echo "desktop Arc A770" ;;
+        56a1) echo "desktop Arc A750" ;;
+        56a2) echo "desktop Arc A580" ;;
+        56a5) echo "desktop Arc A380" ;;
+        *)    echo "unlisted Arc Alchemist [8086:$id]" ;;
+    esac
+}
+
+# PCIe root port the device hangs off, e.g. 0000:00:01.0
+root_port_of() {
+    local p
+    p=$(readlink -f "$(sysdev "$1")" 2>/dev/null) || return 1
+    p=${p#/sys/devices/pci*/}
+    echo "${p%%/*}"
+}
+
+detect_devs() {
+    local d class
+    if [[ -z $DGPU_VGA ]]; then
+        for d in /sys/bus/pci/devices/*; do
+            [[ -r $d/class ]] || continue
+            class=$(<"$d/class")
+            [[ $class == 0x03* ]] || continue
+            is_alchemist "$d" || continue
+            DGPU_VGA=$(basename "$d")
+            break
+        done
+    fi
+    # NOTE: must NOT die here. When the dGPU is PCI-removed there is legitimately
+    # no 0x0300 device to find, and `on`/`status` still need to run.
+    [[ -n $DGPU_VGA ]] || return 1
+
+    # Audio companion: on Arc mobile it is a separate device behind the same
+    # PCIe switch, not function .1. Pick the 0x0403 device that is NOT on bus 00.
+    if [[ -z $DGPU_AUD ]]; then
+        local sib
+        # preferred: same domain:bus:dev, function 1
+        sib="${DGPU_VGA%.*}.1"
+        if [[ -e /sys/bus/pci/devices/$sib/class ]] && [[ $(<"/sys/bus/pci/devices/$sib/class") == 0x0403* ]]; then
+            DGPU_AUD=$sib
+        else
+            # otherwise: the Intel HDA device behind the SAME root port as the
+            # GPU (on Arc it sits behind the card's own PCIe switch). Matching
+            # the root port keeps this correct with several cards installed.
+            local gpu_root
+            gpu_root=$(root_port_of "$DGPU_VGA")
+            for d in /sys/bus/pci/devices/*; do
+                [[ -r $d/class ]] || continue
+                class=$(<"$d/class")
+                [[ $class == 0x0403* ]] || continue
+                [[ $(<"$d/vendor") == 0x8086 ]] || continue
+                sib=$(basename "$d")
+                [[ $sib == 0000:00:* ]] && continue      # skip PCH HDA
+                [[ $(root_port_of "$sib") == "$gpu_root" ]] || continue
+                DGPU_AUD=$sib
+                break
+            done
+        fi
+    fi
+    vlog "dGPU VGA=$DGPU_VGA AUD=${DGPU_AUD:-none}"
+}
+
+sysdev() { echo "/sys/bus/pci/devices/$1"; }
+present() { [[ -e $(sysdev "$1") ]]; }
+# Read the driver name from the sysfs symlink TARGET directly.
+# Do NOT use `readlink -f` here: canonicalising through sysfs can collapse to
+# the literal ".../driver" component instead of the driver directory, which is
+# what produced "driver=driver" and the bogus /sys/bus/pci/drivers/driver path.
+drv_of() {
+    local link tgt
+    link="$(sysdev "$1")/driver"
+    [[ -L $link ]] || return 1
+    tgt=$(readlink "$link" 2>/dev/null) || return 1
+    [[ -n $tgt ]] || return 1
+    basename "$tgt"
+}
+
+upstream_port() {
+    # first PCIe port ancestor of the dGPU
+    local p
+    p=$(readlink -f "$(sysdev "$DGPU_VGA")")
+    p=${p%/*}
+    while [[ $p == /sys/devices/* ]]; do
+        [[ -e $p/vendor && -e $p/power/control ]] && { echo "$p"; return 0; }
+        p=${p%/*}
+    done
+    return 1
+}
+
+# ---------- in-use check ----------------------------------------------------
+# Having a DRM node of the dGPU open is NOT the same as using the dGPU:
+#   * PID 1 (logind's fd store), systemd-logind, plymouth, Xorg and every
+#     Wayland compositor / Xwayland open ALL DRM cards for multi-GPU and
+#     hotplug handling. They get a udev "remove" event and drop the card.
+#   * Mesa / Vulkan loaders open every render node while enumerating GPUs,
+#     without ever submitting work to the ones they do not pick.
+# What really matters is whether a client has work or memory on the dGPU. The
+# kernel publishes that per DRM client in /proc/<pid>/fdinfo/<fd>
+# (drm-engine-*, drm-cycles-*, drm-total-*/drm-resident-*; see the kernel's
+# Documentation/gpu/drm-usage-stats.rst), for both i915 and xe.
+#
+# Holders are found by DEVICE NUMBER, not by path: every fd of every process
+# that points at a /dev node is stat'ed once, so renamed nodes, containers
+# (podman/flatpak/docker --device) and /dev/dri/by-path links are all caught.
+# Processes that closed the fd but still have dGPU buffers mmap'ed are found
+# through /proc/<pid>/maps.
+#
+# Policy per process:
+#   busy     engine time advanced during the sample window            -> refuse
+#   session  SESSION_HOLDERS name, system binary, idle, small memory   -> ignored
+#   used     has engine time, memory or mappings on the dGPU           -> refuse
+#   unknown  fdinfo has no DRM usage stats (old kernel)                -> refuse
+#   idle     opened only (enumeration), no work, no memory             -> allowed
+# Display, audio and vfio are guarded separately in safety_checks.
+# STRICT_IN_USE=1 restores "any open handle refuses".
+SESSION_HOLDERS_DEFAULT="systemd systemd-logind plymouthd Xorg X Xwayland kwin_wayland kwin_wayland_wr kwin_x11 gnome-shell mutter sway Hyprland labwc weston cosmic-comp"
+PROC_ROOT=/proc            # tests point these at a fake tree; not taken from env
+ASOUND_ROOT=/proc/asound
+
+# "<major>:<minor> <node>" for every DRM node (card*, renderD*) of the dGPU.
+dgpu_drm_devnums() {
+    local n
+    for n in "$(sysdev "$DGPU_VGA")"/drm/card* "$(sysdev "$DGPU_VGA")"/drm/renderD*; do
+        [[ -r $n/dev ]] && echo "$(<"$n/dev") ${n##*/}"
+    done
+    return 0
+}
+
+# "<rawmode-hex>|<major-hex>|<minor-hex>|<fd path>" for every fd of every
+# process that points at a /dev node. Link text is read without touching the
+# target (no hang on dead NFS mounts); only /dev nodes are stat'ed, in one go.
+list_dev_fds() {
+    find "$PROC_ROOT"/[0-9]*/fd -maxdepth 1 -type l -lname '/dev/*' -print0 2>/dev/null \
+        | xargs -0 -r stat -L --printf '%f|%t|%T|%n\n' 2>/dev/null || true
+}
+
+# PIDs that have one of the given DRM node names mmap'ed (buffers stay alive
+# through the mapping even after the fd is closed).
+list_mappers() {
+    local re=$1
+    grep -lE " /dev/dri/($re)( \(deleted\))?\$" "$PROC_ROOT"/[0-9]*/maps 2>/dev/null \
+        | while read -r f; do f=${f#"$PROC_ROOT"/}; echo "${f%%/*}"; done || true
+}
+
+# Prints "<seen> <engine> <memory>" for one fdinfo file.
+#   seen   1 if the driver publishes DRM usage stats at all
+#   engine sum of drm-engine-* (ns) and drm-cycles-* (xe); capacity and
+#          drm-total-cycles-* (a free-running GPU clock) are excluded
+#   memory bytes in drm-total-* / drm-resident-* / drm-memory-*
+fdinfo_stats() {
+    awk '
+        /^drm-(driver|pdev|client-id):/       { seen = 1 }
+        /^drm-engine-capacity-/               { next }
+        /^drm-total-cycles-/                  { next }
+        /^drm-engine-[^:]+:/                  { eng += $2; seen = 1; next }
+        /^drm-cycles-[^:]+:/                  { eng += $2; seen = 1; next }
+        /^drm-(total|resident|memory)-[^:]+:/ {
+            v = $2
+            if ($3 == "KiB") v *= 1024
+            else if ($3 == "MiB") v *= 1048576
+            else if ($3 == "GiB") v *= 1073741824
+            mem += v; seen = 1
+        }
+        END { printf "%d %.0f %.0f\n", seen, eng, mem }
+    ' "$1" 2>/dev/null || echo "0 0 0"
+}
+
+sample_wait() { sleep "${USAGE_SAMPLE:-1}"; }
+
+in_list() { [[ " $2 " == *" $1 "* ]]; }
+
+# A session holder must run from a root-owned system path, so a random user
+# process cannot get exempted just by calling itself "Xorg" or "X".
+# /usr/local is excluded: it is group-writable (staff) on Debian.
+system_exe() {
+    local e
+    e=$(readlink "$PROC_ROOT/$1/exe" 2>/dev/null) || return 1
+    e=${e% (deleted)}                       # binary replaced by an upgrade
+    case $e in
+        /usr/local/*) return 1 ;;
+        /usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*) return 0 ;;
+    esac
+    return 1
+}
+
+human_bytes() {
+    awk -v b="$1" 'BEGIN{ split("B KiB MiB GiB",u," "); i=1
+        while (b >= 1024 && i < 4) { b /= 1024; i++ } printf "%.1f %s", b, u[i] }'
+}
+
+# Returns 0 when the dGPU can go, 1 when something really uses it.
+check_users() {
+    local -A want=() nodes=() comm=() first=() seen=() eng=() mem=() fds=() mapped=()
+    local mm name pid key s e m holders mode maj min path re=""
+    holders=${SESSION_HOLDERS:-$SESSION_HOLDERS_DEFAULT}
+    local memmax=$(( ${SESSION_MEM_MAX:-128} * 1048576 ))
+
+    while read -r mm name; do want[$mm]=$name; re+="${re:+|}$name"; done < <(dgpu_drm_devnums)
+    if [[ ${#want[@]} -eq 0 ]]; then
+        vlog "dGPU exposes no DRM nodes - nothing can be using it"
+        return 0
+    fi
+
+    # pass 1: which processes hold a dGPU node (by device number), counters now
+    while IFS='|' read -r mode maj min path; do
+        [[ -n $path ]] || continue
+        (( (16#$mode & 0xF000) == 0x2000 )) || continue          # char devices only
+        mm="$((16#$maj)):$((16#$min))"
+        [[ -n ${want[$mm]:-} ]] || continue
+        pid=${path#"$PROC_ROOT"/}; pid=${pid%%/*}
+        key="$pid/${path##*/}"
+        # process exited / fd closed since the scan: not a user any more
+        [[ -r $PROC_ROOT/$pid/fdinfo/${path##*/} ]] || continue
+        fds[$key]=$path
+        nodes[$pid]+="${want[$mm]} "
+        comm[$pid]=$(cat "$PROC_ROOT/$pid/comm" 2>/dev/null || echo "?")
+        read -r s e m < <(fdinfo_stats "$PROC_ROOT/$pid/fdinfo/${path##*/}")
+        first[$key]=$e; seen[$key]=$s; mem[$key]=$m
+    done < <(list_dev_fds)
+
+    # processes with dGPU buffers mapped (with or without an open fd)
+    while read -r pid; do
+        [[ -n $pid ]] || continue
+        mapped[$pid]=1
+        [[ -n ${comm[$pid]:-} ]] || comm[$pid]=$(cat "$PROC_ROOT/$pid/comm" 2>/dev/null || echo "?")
+        [[ -n ${nodes[$pid]:-} ]] || nodes[$pid]="mmap "
+    done < <(list_mappers "$re")
+
+    if [[ ${#fds[@]} -eq 0 && ${#mapped[@]} -eq 0 ]]; then
+        vlog "no process holds a dGPU DRM node"
+        return 0
+    fi
+
+    # pass 2: did any engine counter move during the sample window?
+    if [[ ${#fds[@]} -gt 0 ]]; then
+        sample_wait
+        for key in "${!fds[@]}"; do
+            pid=${key%%/*}
+            read -r s e m < <(fdinfo_stats "$PROC_ROOT/$pid/fdinfo/${key#*/}")
+            eng[$key]=$(( e > ${first[$key]} ? e - ${first[$key]} : 0 ))
+        done
+    fi
+
+    # verdict per process: worst of its handles (busy > used > session > idle)
+    local -A verdict=() why=() pmem=() pbusy=() pwork=() pnostats=()
+    for key in "${!fds[@]}"; do
+        pid=${key%%/*}
+        pmem[$pid]=$(( ${pmem[$pid]:-0} + ${mem[$key]} ))
+        [[ ${eng[$key]} -gt 0 ]]   && pbusy[$pid]=1
+        [[ ${first[$key]} -gt 0 ]] && pwork[$pid]=1
+        [[ ${seen[$key]} -ne 1 ]]  && pnostats[$pid]=1
+    done
+    local session
+    for pid in "${!comm[@]}"; do
+        session=0
+        in_list "${comm[$pid]}" "$holders" && system_exe "$pid" && session=1
+        if [[ ${STRICT_IN_USE:-0} == 1 ]]; then
+            verdict[$pid]=used; why[$pid]="open handle (STRICT_IN_USE=1)"
+        elif [[ -n ${pbusy[$pid]:-} ]]; then
+            verdict[$pid]=busy; why[$pid]="rendering/computing on the dGPU right now"
+        elif [[ $session == 1 && $memmax -gt 0 && ${pmem[$pid]:-0} -gt $memmax ]]; then
+            verdict[$pid]=used; why[$pid]="session process holds $(human_bytes "${pmem[$pid]}") on the dGPU (> SESSION_MEM_MAX) - it is rendering there"
+        elif [[ $session == 1 ]]; then
+            verdict[$pid]=session; why[$pid]="session/compositor handle, idle ($(human_bytes "${pmem[$pid]:-0}"))"
+        elif [[ -n ${pnostats[$pid]:-} ]]; then
+            verdict[$pid]=used; why[$pid]="no DRM usage stats in fdinfo - cannot prove it idle"
+        elif [[ -n ${pwork[$pid]:-} || ${pmem[$pid]:-0} -gt 0 ]]; then
+            verdict[$pid]=used; why[$pid]="has work/allocations on the dGPU ($(human_bytes "${pmem[$pid]:-0}"))"
+        elif [[ -n ${mapped[$pid]:-} ]]; then
+            verdict[$pid]=used; why[$pid]="has dGPU buffers mmap'ed"
+        else
+            verdict[$pid]=idle; why[$pid]="opened only (GPU enumeration), no work, no memory"
+        fi
+    done
+
+    local blocked=0 line
+    for pid in $(printf '%s\n' "${!verdict[@]}" | sort -n); do
+        line=$(printf 'pid %-7s %-16s %-22s %s' "$pid" "${comm[$pid]}" \
+               "$(tr ' ' '\n' <<<"${nodes[$pid]}" | sort -u | xargs)" "${why[$pid]}")
+        case ${verdict[$pid]} in
+            busy|used) [[ $blocked -eq 0 ]] && log "the dGPU is in use:"
+                       blocked=1; echo "  $line" >&2 ;;
+            *)         vlog "ignored: $line" ;;
+        esac
+    done
+    return "$blocked"
+}
+
+# Running PCM streams on the dGPU's HDA (HDMI/DP audio) codec.
+audio_streams() {
+    local c n st out=""
+    [[ -n ${DGPU_AUD:-} ]] && present "$DGPU_AUD" || return 1
+    for c in "$(sysdev "$DGPU_AUD")"/sound/card*; do
+        [[ -d $c ]] || continue
+        n=${c##*/card}
+        for st in "$ASOUND_ROOT/card$n"/pcm*/sub*/status; do
+            [[ -r $st ]] && grep -q '^state: RUNNING' "$st" 2>/dev/null && \
+                out+="card$n/${st#"$ASOUND_ROOT/card$n/"} "
+        done
+    done
+    [[ -n $out ]] && echo "${out% }"
+}
+
+# ---------- display safety ---------------------------------------------------
+# Any DRM connector of the dGPU with a monitor attached (incl. an internal
+# panel on a MUXed laptop in dGPU mode, or a monitor in a desktop card).
+connected_outputs() {
+    local c card dev name out=""
+    for c in /sys/class/drm/card*-*/status; do
+        [[ -r $c ]] || continue
+        # a monitor plugged in, or a connector the compositor is driving
+        [[ $(<"$c") == connected ]] || \
+            [[ -r ${c%/status}/enabled && $(<"${c%/status}/enabled") == enabled ]] || continue
+        card=${c%/status}; card=${card##*/}; card=${card%%-*}
+        dev=$(readlink -f "/sys/class/drm/$card/device" 2>/dev/null) || continue
+        [[ ${dev##*/} == "$DGPU_VGA" ]] || continue
+        name=${c%/status}; out+="${name##*/} "
+    done
+    [[ -n $out ]] && echo "$out"
+}
+
+# Another display controller (the iGPU) must be present with a driver bound,
+# otherwise switching the dGPU off leaves the machine without any display.
+other_display_ok() {
+    local d class
+    for d in /sys/bus/pci/devices/*; do
+        [[ -r $d/class ]] || continue
+        class=$(<"$d/class")
+        [[ $class == 0x03* ]] || continue
+        [[ ${d##*/} == "$DGPU_VGA" ]] && continue
+        [[ -L $d/driver ]] && return 0
+    done
+    return 1
+}
+
+safety_checks() {
+    local model tier outs bv
+    model=$(model_of "$DGPU_VGA"); tier=${model%% *}
+    case $tier in
+        mobile|desktop) ;;
+        *) [[ ${ALLOW_UNSUPPORTED:-0} == 1 ]] || \
+               die "$model is not on the supported list (set ALLOW_UNSUPPORTED=1 to try anyway)" ;;
+    esac
+    [[ ${FORCE:-0} == 1 ]] && { log "FORCE=1: skipping safety checks"; return 0; }
+
+    other_display_ok || \
+        die "no other display controller (iGPU) is active - switching off would leave no display"
+    if outs=$(connected_outputs); then
+        die "monitor connected to the dGPU (${outs% }) - connect it to the motherboard/iGPU output"
+    fi
+    case $(drv_of "$DGPU_VGA" || true) in
+        vfio-pci|pci-stub)
+            die "the dGPU is bound to $(drv_of "$DGPU_VGA") (passed through to a VM?) - not touching it" ;;
+    esac
+    bv=$(sysdev "$DGPU_VGA")/boot_vga
+    if [[ -r $bv && $(<"$bv") == 1 ]]; then
+        die "the dGPU is the firmware boot display - set the iGPU as primary display in the BIOS"
+    fi
+    if outs=$(audio_streams); then
+        die "audio is playing through the dGPU (${outs}) - stop it first (or FORCE=1)"
+    fi
+    check_users || die "refusing to disable a GPU in use - close these programs (or FORCE=1)"
+}
+
+# ---------- core actions ----------------------------------------------------
+unbind() {
+    local dev=$1 drv path
+    present "$dev" || return 0
+    drv=$(drv_of "$dev") || { vlog "$dev has no driver bound, nothing to unbind"; return 0; }
+
+    # Prefer the device's own driver/unbind node - it is always correct and does
+    # not depend on reconstructing the driver directory name.
+    path="$(sysdev "$dev")/driver/unbind"
+    [[ -w $path ]] || path="/sys/bus/pci/drivers/$drv/unbind"
+    if [[ ! -w $path ]]; then
+        log "cannot find a writable unbind node for $dev (driver=$drv)"
+        return 1
+    fi
+
+    vlog "unbinding $dev from $drv via $path"
+    echo "$dev" > "$path"
+    # let the component framework settle before the next teardown step
+    sleep 0.3
+}
+
+# ---------- driver_override ------------------------------------------------
+# `driver_override` is a sysfs string that pins a device to ONE named driver.
+# The literal value "none" means "bind to nothing", so every bind attempt and
+# every autoprobe after a rescan is silently refused - the device reappears
+# with driver=none and no error anywhere. It does not survive a reboot, so if
+# it is set, something (udev rule, vfio script, power tweak) applied it.
+# Writing an empty line clears it; reading back gives "(null)" when clear.
+show_override() {
+    local dev=$1 f cur
+    f="$(sysdev "$dev")/driver_override"
+    [[ -e $f ]] || return 0
+    cur=$(<"$f") || return 0
+    [[ -z $cur || $cur == "(null)" ]] && return 0
+    echo "       !! $dev driver_override='$cur' - this BLOCKS driver binding"
+    echo "          fix: sudo arc-dgpu-ctl on   (clears it automatically)"
+}
+
+clear_override() {
+    local dev=$1 f cur
+    f="$(sysdev "$dev")/driver_override"
+    [[ -e $f ]] || return 0
+    cur=$(<"$f") || return 0
+    # Empty file reads back as "" or "(null)" depending on kernel version.
+    [[ -z $cur || $cur == "(null)" ]] && return 0
+    log "note: $dev had driver_override='$cur' - clearing it"
+    echo "" > "$f" 2>/dev/null || {
+        log "  failed to clear driver_override on $dev"
+        return 1
+    }
+    return 0
+}
+
+rebind() {
+    local dev=$1 want=${2:-} drv err
+    present "$dev" || return 0
+    if drv=$(drv_of "$dev"); then
+        vlog "$dev already bound to $drv"
+        return 0
+    fi
+
+    # A stale driver_override blocks every bind path below. Clear it first.
+    clear_override "$dev" || true
+
+    # Make sure the PCI core is allowed to attach drivers at all. If this was
+    # ever set to 0 (some power-tuning tools do it) a rescan re-enumerates the
+    # device but deliberately leaves it driverless - exactly the symptom of
+    # "came back but no driver bound".
+    if [[ -w /sys/bus/pci/drivers_autoprobe ]] && [[ $(</sys/bus/pci/drivers_autoprobe) != 1 ]]; then
+        log "note: pci drivers_autoprobe was 0, enabling it"
+        echo 1 > /sys/bus/pci/drivers_autoprobe || true
+    fi
+
+    # Candidate drivers, in order. For the GPU try the configured one, then the
+    # two possible Intel DRM drivers.
+    local -a cands=()
+    [[ -n $want ]] && cands+=("$want")
+    if [[ $dev == "${DGPU_VGA:-}" ]]; then
+        cands+=(i915 xe)
+    fi
+
+    for drv in "${cands[@]}"; do
+        # Load the module if it is not present yet - without it there is no
+        # /sys/bus/pci/drivers/<drv> directory to bind through.
+        [[ -d /sys/bus/pci/drivers/$drv ]] || modprobe "$drv" 2>/dev/null || true
+        [[ -d /sys/bus/pci/drivers/$drv ]] || { vlog "driver $drv not available"; continue; }
+
+        vlog "attempting bind: $dev -> $drv"
+        # Capture the real error instead of hiding it; probe failures are the
+        # whole point of this diagnostic.
+        err=$( { echo "$dev" > "/sys/bus/pci/drivers/$drv/bind"; } 2>&1 ) || true
+        # PCIe link retrain + driver probe can take a moment on a dGPU.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            drv_of "$dev" >/dev/null && break
+            sleep 0.5
+        done
+        if drv_of "$dev" >/dev/null; then
+            vlog "$dev bound to $drv"
+            return 0
+        fi
+        [[ -n $err ]] && log "bind $dev -> $drv failed: $err"
+    done
+
+    log "warning: $dev came back but no driver bound"
+    log "  try: sudo arc-dgpu-ctl diag    (and check: dmesg | tail -40)"
+    return 1
+}
+
+pci_remove() {
+    local dev=$1
+    present "$dev" || return 0
+    vlog "removing $dev"
+    echo 1 > "$(sysdev "$dev")/remove"
+    sleep 0.2
+}
+
+cache_port() {
+    # Must run BEFORE the device is removed: once it is gone from sysfs we can
+    # no longer walk up from it to find the PCIe port, and status goes blind.
+    local port
+    if port=$(upstream_port); then
+        [[ $EUID -eq 0 ]] && { echo "$port" > "$PORTCACHE"; } 2>/dev/null || true
+        echo "$port"
+        return 0
+    fi
+    return 1
+}
+
+power_port_auto() {
+    local port
+    port=$(port_from_conf) || return 0
+    vlog "setting $port/power/control=auto"
+    echo auto > "$port/power/control" || true
+}
+
+# ---------- power reporting -------------------------------------------------
+# There is no guaranteed per-device wattmeter for a discrete Arc GPU, and once
+# the device is PCI-removed there is nothing left to read at all. So we report
+# three things, cheapest/most-direct first:
+#   1) i915/xe hwmon, if this SKU exposes it (power1_input / energy1_input)
+#   2) the PCIe port runtime state - `suspended` is what D3cold looks like
+#   3) system battery discharge rate, which is the number you actually feel
+gpu_hwmon_dir() {
+    local d
+    [[ -n ${DGPU_VGA:-} ]] || return 1
+    present "$DGPU_VGA" || return 1
+    for d in "$(sysdev "$DGPU_VGA")"/hwmon/hwmon*; do
+        [[ -d $d ]] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+gpu_power() {
+    local h v e1 e2 t1 t2
+    h=$(gpu_hwmon_dir) || return 1
+    if [[ -r $h/power1_input ]]; then
+        v=$(<"$h/power1_input")                     # microwatts
+        awk -v u="$v" 'BEGIN{printf "%.2f W (hwmon power1_input)\n", u/1000000}'
+        return 0
+    fi
+    if [[ -r $h/energy1_input ]]; then              # microjoules, integrate
+        e1=$(<"$h/energy1_input"); t1=$(date +%s.%N)
+        sleep 1
+        e2=$(<"$h/energy1_input"); t2=$(date +%s.%N)
+        awk -v a="$e1" -v b="$e2" -v x="$t1" -v y="$t2" \
+            'BEGIN{d=(b-a)/1000000; s=y-x; if(s>0) printf "%.2f W (hwmon energy1_input, 1s avg)\n", d/s}'
+        return 0
+    fi
+    return 1
+}
+
+# CPU package power via RAPL. NOTE: this does NOT include the discrete GPU -
+# RAPL only covers CPU package domains. It is reported because it is one of the
+# few readings that still works while on AC, and it lets you confirm the CPU is
+# not the thing that changed between two measurements.
+rapl_power() {
+    local d e1 e2 t1 t2
+    d=/sys/class/powercap/intel-rapl:0
+    [[ -r $d/energy_uj ]] || return 1
+    e1=$(<"$d/energy_uj"); t1=$(date +%s.%N)
+    sleep 1
+    e2=$(<"$d/energy_uj"); t2=$(date +%s.%N)
+    awk -v a="$e1" -v b="$e2" -v x="$t1" -v y="$t2" \
+        'BEGIN{ d=(b-a)/1000000; s=y-x; if(d>=0 && s>0) printf "%.2f W\n", d/s }'
+}
+
+battery_draw() {
+    local b p c v
+    for b in /sys/class/power_supply/BAT*; do
+        [[ -d $b ]] || continue
+        if [[ -r $b/power_now ]]; then
+            p=$(<"$b/power_now")
+            [[ $p -gt 0 ]] && awk -v u="$p" 'BEGIN{printf "%.2f W\n", u/1000000}' && return 0
+        fi
+        if [[ -r $b/current_now && -r $b/voltage_now ]]; then
+            c=$(<"$b/current_now"); v=$(<"$b/voltage_now")
+            [[ $c -gt 0 && $v -gt 0 ]] && \
+                awk -v i="$c" -v u="$v" 'BEGIN{printf "%.2f W\n", (i/1000000)*(u/1000000)}' && return 0
+        fi
+    done
+    return 1
+}
+
+on_ac() {
+    local a
+    for a in /sys/class/power_supply/A{C,DP}*/online; do
+        [[ -r $a ]] && [[ $(<"$a") == 1 ]] && return 0
+    done
+    return 1
+}
+
+report_power() {
+    local val port
+    if val=$(gpu_power); then
+        echo "gpu  : $val"
+    elif [[ -n ${DGPU_VGA:-} ]] && present "$DGPU_VGA"; then
+        echo "gpu  : no hwmon power sensor exposed by this driver/SKU"
+    else
+        echo "gpu  : n/a (device removed from bus - nothing to read)"
+    fi
+
+    # Walk from the dGPU's port up to the root port. On Arc the first hops are
+    # the card's own PCIe switch; the ROOT port reaching "suspended" is what
+    # actually cuts slot power (D3cold).
+    if port=$(upstream_port 2>/dev/null) || port=$(port_from_conf); then
+        local p last=""
+        p=$port
+        while [[ $p == /sys/devices/pci*/* && -e $p/power/runtime_status ]]; do
+            echo "port : ${p##*/} power=$(<"$p/power/control") state=$(<"$p/power/runtime_status")"
+            last=$p
+            p=${p%/*}
+        done
+        if [[ -n $last && $(<"$last/power/runtime_status") != suspended && ! -e $(sysdev "${DGPU_VGA:-none}") ]]; then
+            echo "       note: root port is NOT suspended - no D3cold saving (see README)"
+        fi
+    fi
+
+    if val=$(rapl_power); then
+        echo "cpu  : $val (RAPL package - excludes the dGPU)"
+    fi
+
+    if val=$(battery_draw); then
+        echo "batt : $val discharge (whole system)"
+    elif on_ac; then
+        echo "batt : on AC - the gauge measures charging, not load."
+        echo "       See the README section \"Measuring the power saving\"."
+    fi
+}
+
+do_power() { detect_devs || true; report_power; }
+
+do_diag() {
+    detect_devs || true
+    echo "== $PROG $VERSION diagnostics =="
+    echo "-- detection"
+    echo "   DGPU_VGA=${DGPU_VGA:-<none>}  DGPU_AUD=${DGPU_AUD:-<none>}"
+    [[ -n ${DGPU_VGA:-} ]] && present "$DGPU_VGA" && {
+        echo "   model=$(model_of "$DGPU_VGA")  root_port=$(root_port_of "$DGPU_VGA")"
+        echo "   connected outputs on dGPU: $(connected_outputs || echo none)"
+        other_display_ok && echo "   other display controller: active" \
+                         || echo "   other display controller: NONE"
+    }
+    echo "-- driver_override (literal 'none' blocks all binding)"
+    for d in "${DGPU_VGA:-}" "${DGPU_AUD:-}"; do
+        [[ -n $d && -e /sys/bus/pci/devices/$d/driver_override ]] && \
+            echo "   $d: $(<"/sys/bus/pci/devices/$d/driver_override")"
+    done
+    echo "-- udev rules mentioning driver_override"
+    grep -rsn driver_override /etc/udev/rules.d/ /lib/udev/rules.d/ \
+        /usr/lib/udev/rules.d/ 2>/dev/null | sed 's/^/   /' || echo "   (none)"
+    echo "-- pci autoprobe"
+    [[ -r /sys/bus/pci/drivers_autoprobe ]] && \
+        echo "   drivers_autoprobe=$(</sys/bus/pci/drivers_autoprobe)"
+    echo "-- drm drivers present"
+    for d in i915 xe snd_hda_intel; do
+        if [[ -d /sys/bus/pci/drivers/$d ]]; then
+            echo "   $d: present"
+        else
+            echo "   $d: NOT loaded (modprobe $d)"
+        fi
+    done
+    echo "-- devices bound to i915/xe"
+    for d in /sys/bus/pci/drivers/i915/0000:* /sys/bus/pci/drivers/xe/0000:*; do
+        [[ -e $d ]] && echo "   $(basename "$d") -> $(basename "$(dirname "$d")")"
+    done
+    echo "-- module blacklist / modprobe options"
+    grep -rsiE 'i915|xe|force_probe' /etc/modprobe.d/ 2>/dev/null | sed 's/^/   /' || true
+    echo "-- kernel cmdline"
+    sed 's/^/   /' /proc/cmdline
+    echo "-- power"
+    report_power
+    echo "-- recent kernel messages"
+    local pat='i915|xe |drm|pcieport'
+    [[ -n ${DGPU_VGA:-} ]] && pat+="|${DGPU_VGA#0000:}"
+    [[ -n ${DGPU_AUD:-} ]] && pat+="|${DGPU_AUD#0000:}"
+    dmesg 2>/dev/null | grep -iE "$pat" | tail -20 | sed 's/^/   /' || true
+}
+
+do_off() {
+    need_root
+    if ! detect_devs; then log "dGPU already off (no Arc Alchemist GPU on the bus)"; save_state off; return 0; fi
+    if ! present "$DGPU_VGA"; then log "dGPU already off"; save_state off; return 0; fi
+    safety_checks
+
+    # Capture the PCIe port path while the device still exists on the bus.
+    cache_port >/dev/null || vlog "could not resolve upstream PCIe port"
+
+    # ORDER MATTERS - audio first, then the GPU itself.
+    [[ -n ${DGPU_AUD:-} ]] && unbind "$DGPU_AUD"
+    unbind "$DGPU_VGA"
+
+    [[ -n ${DGPU_AUD:-} ]] && pci_remove "$DGPU_AUD"
+    pci_remove "$DGPU_VGA"
+
+    power_port_auto
+    save_state off
+    log "dGPU disabled"
+}
+
+do_on() {
+    need_root
+    save_state on
+    # Rescan FIRST when nothing is detected - the device is absent from sysfs
+    # precisely because it was PCI-removed, so detection can only work after.
+    if ! detect_devs || ! present "$DGPU_VGA"; then
+        vlog "rescanning PCI bus"
+        echo 1 > /sys/bus/pci/rescan
+        sleep 1
+        DGPU_VGA=""; DGPU_AUD=""
+        # shellcheck source=data/arc-dgpu-ctl.conf
+        [[ -f $CONF ]] && . "$CONF"
+    else
+        log "dGPU already present"
+    fi
+    detect_devs || die "dGPU did not reappear after rescan (is it disabled in BIOS?)"
+    present "$DGPU_VGA" || die "dGPU did not reappear after rescan"
+    local port
+    if port=$(upstream_port); then echo on > "$port/power/control" || true; fi
+
+    # A bus rescan re-enumerates the device but does not always re-probe a
+    # driver (drivers_autoprobe state, or the module having seen an explicit
+    # unbind). Bind explicitly when nothing attached itself.
+    clear_override "$DGPU_VGA" || true
+    [[ -n ${DGPU_AUD:-} ]] && { clear_override "$DGPU_AUD" || true; }
+
+    rebind "$DGPU_VGA" "${GPU_DRIVER:-}" || true
+    [[ -n ${DGPU_AUD:-} ]] && { rebind "$DGPU_AUD" snd_hda_intel || true; }
+
+    log "dGPU enabled: $DGPU_VGA driver=$(drv_of "$DGPU_VGA" || echo none)"
+    [[ -n ${DGPU_AUD:-} ]] && log "dGPU audio: $DGPU_AUD driver=$(drv_of "$DGPU_AUD" || echo none)"
+}
+
+boot_line() {
+    local en=""
+    command -v systemctl >/dev/null 2>&1 && \
+        en=$(systemctl is-enabled arc-dgpu-ctl.service 2>/dev/null || true)
+    echo "boot : saved=$(saved_state)  arc-dgpu-ctl.service=${en:-unknown}"
+}
+
+do_status() {
+    if ! detect_devs || ! present "${DGPU_VGA:-none}"; then
+        echo "dGPU : OFF (removed from PCI bus - run 'sudo arc-dgpu-ctl on' to restore)"
+        boot_line
+        report_power
+        return 0
+    fi
+    echo "dGPU : ON  ($DGPU_VGA, $(model_of "$DGPU_VGA" | cut -d' ' -f2-), driver=$(drv_of "$DGPU_VGA" || echo none))"
+    show_override "$DGPU_VGA"
+    [[ -n ${DGPU_AUD:-} ]] && show_override "$DGPU_AUD"
+    [[ -n ${DGPU_AUD:-} ]] && present "$DGPU_AUD" && \
+        echo "audio: ON  ($DGPU_AUD, driver=$(drv_of "$DGPU_AUD" || echo none))"
+    boot_line
+    cache_port >/dev/null || true
+    report_power
+}
+
+# Machine-readable state for callers (e.g. a parent project's GUI/daemon).
+# Prints exactly "on" or "off" on stdout, no root needed. Stable interface.
+do_state() {
+    if detect_devs && present "${DGPU_VGA:-none}"; then echo on; else echo off; fi
+}
+
+# Boot: wait until the PCI drivers have settled, then apply the saved state.
+# Runs before the display manager, so Xorg / the compositor never see the dGPU.
+wait_for_drivers() {
+    local i n=$(( ${RESTORE_WAIT:-15} * 2 ))
+    for (( i = 0; i < n; i++ )); do
+        if detect_devs && present "$DGPU_VGA"; then
+            drv_of "$DGPU_VGA" >/dev/null && other_display_ok && return 0
+        fi
+        sleep 0.5
+    done
+    vlog "drivers not settled after ${RESTORE_WAIT:-15}s - continuing anyway"
+}
+
+do_restore() {
+    need_root
+    local s
+    s=$(saved_state)
+    if [[ $s != off ]]; then
+        vlog "saved state is '$s' - leaving the dGPU as it is"
+        return 0
+    fi
+    wait_for_drivers
+    log "restoring saved state: off"
+    do_off
+}
+
+usage() {
+    cat <<USAGE
+usage: $PROG <command>
+
+  status    state, model, drivers, PCIe port power states, power draw (default)
+  state     print "on" or "off" only (machine-readable, stable)
+  on        rescan PCI, clear driver_override, rebind drivers       [root]
+  off       safety checks, audio -> gpu teardown, PCI remove        [root]
+  restore   apply the saved on/off state (run at boot by the service) [root]
+  power     power readings only
+  diag      troubleshooting dump
+  version   print version
+  help      this text
+
+env: FORCE=1              skip display / in-use safety checks
+     ALLOW_UNSUPPORTED=1  allow unlisted Alchemist models (A310, Pro, ...)
+     PERSIST=0            on/off without changing the saved boot state
+     VERBOSE=1            log each step
+     ARC_DGPU_CTL_CONF=   alternative config file
+exit codes: 0 ok, 1 error, 2 usage error
+USAGE
+}
+
+# Allow `source`-ing the functions (tests) without running a command.
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+
+case "${1:-status}" in
+    off)    do_off ;;
+    on)     do_on ;;
+    status) do_status ;;
+    state)  do_state ;;
+    restore) do_restore ;;
+    power)  do_power ;;
+    diag)   do_diag ;;
+    version|--version|-V) echo "$PROG $VERSION" ;;
+    help|--help|-h)       usage ;;
+    *)      usage >&2; exit 2 ;;
+esac

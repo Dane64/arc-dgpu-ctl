@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+    fi
+    # Migrate from 3.x: an enabled arc-dgpu-off.service meant "off at
+    # every boot" - that is now the saved state "off".
+    if [ -n "$2" ] && dpkg --compare-versions "$2" lt 4.0.0; then
+        for l in /etc/systemd/system/*.wants/arc-dgpu-off.service; do
+            [ -L "$l" ] || continue
+            mkdir -p /var/lib/arc-dgpu-ctl
+            [ -e /var/lib/arc-dgpu-ctl/state ] || echo off > /var/lib/arc-dgpu-ctl/state
+            rm -f "$l"
+        done
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper purge arc-dgpu-off.service >/dev/null 2>&1 || true
+        fi
+    fi
+    if [ -z "$2" ]; then
+        echo "arc-dgpu-ctl installed. 'sudo arc-dgpu-ctl off' switches the dGPU off and keeps it off across reboots."
+    fi
+fi
+#DEBHELPER#
+exit 0

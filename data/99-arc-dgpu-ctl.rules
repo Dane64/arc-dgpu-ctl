@@ -1,0 +1,23 @@
+# 99-arc-dgpu-ctl.rules - defensive rule shipped with arc-dgpu-ctl
+#
+# driver_override pins a PCI device to exactly one named driver. The literal
+# string "none" means "bind to nothing", so explicit binds and autoprobe after
+# `echo 1 > /sys/bus/pci/rescan` are silently refused and the device reappears
+# with driver=none and no error logged anywhere.
+#
+# This rule clears the override on Intel Arc Alchemist (DG2) GPUs and their HDA
+# audio companion whenever they are added to the bus (boot and every
+# `arc-dgpu-ctl on`). Other GPUs, the iGPU and the PCH codec are not matched.
+#
+# Using vfio-pci passthrough for an Arc card? Remove this file (or install with
+# WITH_UDEV=0 / --no-udev) - it would fight your configuration.
+
+# Arc Alchemist VGA/display function (vendor 8086, DG2 device IDs)
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x8086", ATTR{class}=="0x03*", \
+  ATTR{device}=="0x5690|0x5691|0x5692|0x5693|0x5694|0x5695|0x5696|0x5697|0x56a0|0x56a1|0x56a2|0x56a3|0x56a4|0x56a5|0x56a6|0x56b0|0x56b1|0x56b2|0x56b3|0x56ba|0x56bb|0x56bc|0x56bd|0x56be|0x56bf", \
+  ATTR{driver_override}=""
+
+# Intel HDA audio NOT on bus 00 (bus 00 is the chipset's own codec). On Intel
+# platforms the only Intel HDA off bus 00 is a discrete Arc card's audio.
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x8086", ATTR{class}=="0x040300", \
+  KERNEL!="0000:00:*", ATTR{driver_override}=""
