@@ -60,7 +60,7 @@ jobs:
           hash -r   # bash cached the path from the earlier call
           test ! -e /usr/bin/arc-dgpu-ctl
           ! command -v arc-dgpu-ctl
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: deb
           path: dist/*.deb
